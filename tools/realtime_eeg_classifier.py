@@ -431,29 +431,34 @@ class MuseEEGClassifier:
         """Update the EEG buffer with new sample."""
         self.eeg_buffer.append(eeg_sample)
         
-        # Update raw buffer for processing
-        if len(self.eeg_buffer) >= self.SAMPLE_RATE:
-            # Fill the first segment
-            for i in range(self.SAMPLE_RATE, self.WINDOW_SIZE):
-                if len(self.eeg_buffer) > i:
-                    sample = self.eeg_buffer[i]
-                    for j in range(min(len(sample), self.NUM_EEG_CH)):
-                        self.raw_eeg_buffer[i, j] = sample[j]
+        current_len = len(self.eeg_buffer)
+        
+        # Process a window when we have enough data (at least 2 windows for context)
+        # We need WINDOW_SIZE * 2 samples (1024 samples = 4 seconds at 256 Hz)
+        min_samples_needed = self.WINDOW_SIZE * 2
+        
+        if current_len >= min_samples_needed:
+            # Convert deque to numpy array for processing
+            buffer_list = list(self.eeg_buffer)
+            buffer_array = np.array(buffer_list[-min_samples_needed:])
             
-            # Process the middle window
-            middle_start = self.WINDOW_SIZE
-            middle_end = self.WINDOW_SIZE * 2
+            # Extract the "middle" window: take samples from the middle of the 2-window buffer
+            # This gives us a window that's not too old and not too new
+            window_start = self.WINDOW_SIZE // 2  # Start from 1/4 into the buffer
+            window_end = window_start + self.WINDOW_SIZE
             
-            if len(self.eeg_buffer) >= middle_end:
-                middle_data = self.raw_eeg_buffer[middle_start:middle_end, :]
-                result = self.process_eeg_data(middle_data)
+            if buffer_array.shape[0] >= window_end:
+                middle_data = buffer_array[window_start:window_end, :]
                 
-                if result:
-                    self.meditation_prob_history.append(result['meditation_probability'])
-                    return result
-            
-            # Shift buffers
-            self.raw_eeg_buffer[:self.WINDOW_SIZE*2] = self.raw_eeg_buffer[self.WINDOW_SHIFT:self.WINDOW_SIZE*2+self.WINDOW_SHIFT]
+                # Ensure we have the right shape
+                if middle_data.shape[0] == self.WINDOW_SIZE and middle_data.shape[1] >= self.NUM_EEG_CH:
+                    # Take only the EEG channels we need
+                    eeg_data = middle_data[:, :self.NUM_EEG_CH]
+                    result = self.process_eeg_data(eeg_data)
+                    
+                    if result:
+                        self.meditation_prob_history.append(result['meditation_probability'])
+                        return result
         
         return None
 
@@ -632,6 +637,9 @@ def main():
 
     # Real-time classification loop
     try:
+        last_progress_time = time.time()
+        buffer_filled = False
+        
         while True:
             samples, timestamps = inlet.pull_chunk(timeout=0.1)
             
@@ -642,6 +650,23 @@ def main():
                     
                     # Process the sample
                     result = classifier.update_buffer(eeg_sample)
+                    
+                    # Show progress while filling buffer
+                    buffer_size = len(classifier.eeg_buffer)
+                    min_needed = classifier.WINDOW_SIZE * 2  # Need 1024 samples (4 seconds at 256 Hz)
+                    
+                    if buffer_size < min_needed:
+                        buffer_filled = False
+                        if time.time() - last_progress_time > 0.5:  # Update every 0.5 seconds
+                            progress = min(100.0, (buffer_size / min_needed) * 100)
+                            eta = max(0.0, (min_needed - buffer_size) / classifier.SAMPLE_RATE)
+                            print(f"\rFilling buffer: {buffer_size}/{min_needed} samples ({progress:.1f}%) - ETA: {eta:.1f}s", end='', flush=True)
+                            last_progress_time = time.time()
+                    else:
+                        if not buffer_filled:
+                            print(f"\rBuffer filled! Starting classification...", end='', flush=True)
+                            time.sleep(0.5)  # Brief pause to show message
+                            buffer_filled = True
                     
                     if result:
                         meditation_prob = result['meditation_probability']
